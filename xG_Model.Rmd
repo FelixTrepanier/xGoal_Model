@@ -1,0 +1,231 @@
+---
+title: "xG Model v2"
+author: "FT"
+date: "15/08/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Data acquired using the NHL scraper developed by Evolving Hockey
+https://github.com/evolvingwild/evolving-hockey
+
+Model built on the example of an xG model by Matthew Barlowe 
+https://rstudio-pubs-static.s3.amazonaws.com/311470_f6e88d4842da46e9941cc6547405a051.html 
+(NHL Expected Goals Model - Matthew Barlowe)
+
+# Set up
+## Packages
+```{r setup, include=FALSE}
+using<-function(...) {
+  libs<-unlist(list(...))
+  req<-unlist(lapply(libs,require,character.only=TRUE))
+  need<-libs[req==FALSE]
+  if(length(need)>0){ 
+    install.packages(need)
+    lapply(need,require,character.only=TRUE)
+  }
+}
+
+using('ggplot2','dplyr','rstudioapi','data.table','ggthemes','tidyr','lubridate','scales','grid','pracma','mlr','mclust','mlbench','kernlab','ranger','cmaes','e1071','devtools','readr','stringr','foreach','jsonlite','rvest','xml2','RCurl','xgboost','fastDummies')
+
+if (Sys.getenv("JAVA_HOME")!="")
+  Sys.setenv(JAVA_HOME="")
+
+memory.limit(size=56000)
+
+options(digits=5)
+
+```
+
+## Directory
+```{r}
+current_path<-getActiveDocumentContext()$path
+setwd(dirname(current_path ))
+print(getwd())
+
+```
+
+# Data
+## Loading in data
+```{r}
+data.18_19<-readRDS(paste0(getwd(),'/Data/2018-2019_PbP_Data.rds'))
+data.19_20<-readRDS(paste0(getwd(),'/Data/2019-2020_PbP_Data.rds'))
+
+```
+
+## Separating the different dataframes
+```{r}
+# game_info_df_new<-pbp_scrape$game_info_df           ## game information data
+# pbp_base_new<-pbp_scrape$pbp_base                   ## main play-by-play data
+# pbp_extras_new<-pbp_scrape$pbp_extras               ## extra play-by-play data
+# player_shifts_new<-pbp_scrape$player_shifts         ## full player shifts data
+# player_periods_new<-pbp_scrape$player_periods       ## player TOI sums per period
+# roster_df_new<-pbp_scrape$roster_df                 ## roster data
+# scratches_df_new<-pbp_scrape$scratches_df           ## scratches data
+# event_summary_df_new<-pbp_scrape$events_summary_df  ## event summary data
+# scrape_report<-pbp_scrape$report                    ## scrape report
+
+df.pbp_18_19<-data.18_19$pbp_base
+df.pbp_19_20<-data.19_20$pbp_base
+
+```
+
+## Data exploration
+```{r}
+unique(df.pbp_18_19$event_type)
+# Fenwick events are GOAL,MISS,SHOT
+
+unique(df.pbp_18_19$game_strength_state)
+# E means Extra, so Ev5 is 6v5, but can also be the start of the game before other team gets on ice
+
+unique(df.pbp_18_19$event_detail)
+# When its a fenwick event, this is where the shot type is recorded
+
+```
+
+# Building the dataset
+## Adding basic flags and diff time
+```{r}
+df.pbp_18_19<-df.pbp_18_19%>%
+  filter(game_period<5)%>%
+  mutate(goal_flag = ifelse(event_type == 'GOAL', 1, 0),
+         home_flag = ifelse(event_team == home_team, 1, 0),
+         period_id = paste0(game_id,game_period))%>%
+  group_by(period_id)%>%
+  mutate(time_diff = game_seconds - lag(game_seconds))
+
+df.pbp_18_19$time_diff[is.na(df.pbp_18_19$time_diff)]<-0
+
+```
+
+## Adding rebound and rush flag
+```{r}
+df.pbp_18_19<-df.pbp_18_19%>%
+  mutate(rebound_flag = ifelse(time_diff<3
+                               & event_type %in% c('SHOT','GOAL','MISS')
+                               & lag(event_type) %in% c('SHOT','GOAL','MISS')
+                               & event_team == lag(event_team), 1, 0),
+         rush_flag = ifelse(time_diff<4
+                            & lag(abs(coords_x))<25
+                            & event_type %in% c('SHOT','GOAL','MISS'), 1, 0))%>%
+  filter(event_type %in% c('SHOT','GOAL','MISS'))
+
+df.pbp_18_19$rebound_flag[is.na(df.pbp_18_19$rebound_flag)]<-0
+df.pbp_18_19$rush_flag[is.na(df.pbp_18_19$rush_flag)]<-0
+
+```
+
+## Adding shot location, angle, and distance
+```{r}
+df.pbp_18_19<-df.pbp_18_19%>%
+  filter(coords_x != 'NA' & coords_y != 'NA')%>%
+  mutate(coords_y = ifelse(coords_x < 0, -1*coords_y,coords_y),
+         coords_x = abs(coords_x),
+         shot_angle = (asin(abs(coords_y)/sqrt((87.95 - abs(coords_x))^2 + coords_y^2))*180)/3.14159,
+         shot_angle = ifelse(abs(coords_x) > 88, 90 + (180-(90 + shot_angle)), shot_angle),
+         shot_distance = sqrt((87.95 - abs(coords_x))^2 + coords_y^2))
+
+```
+
+## Looking at shot types closely
+### Dealing with NA
+```{r}
+df.pbp_18_19%>%
+  group_by(event_detail)%>%
+  summarise(n())
+
+df.pbp_18_19%>%
+  filter(is.na(event_detail)==T)
+
+# What are NA shot types? 7 goals out of 10 shots! Will be classified as "Other"
+
+df.pbp_18_19$event_detail[is.na(df.pbp_18_19$event_detail)]<-'Other'
+```
+
+### Difference between Tip-In vs Deflected
+```{r}
+# I am a bit worried tip-in might be a deflected shot that was a goal
+df.pbp_18_19%>%
+  filter(event_detail %in% c('Tip-In','Deflected'))%>%
+  group_by(event_detail)%>%
+  summarize(goal_count = sum(goal_flag),
+            goal_proportion = mean(goal_flag))
+
+# No worries to have here. Maybe deflected is a pass that goes off a skate while tip in an intentionally deflected shot
+```
+
+## Removing empty net goals
+```{r}
+df.pbp_18_19<-df.pbp_18_19%>%
+  mutate(empty_net_goal_flag = ifelse((event_type == 'GOAL'
+                                       & home_flag == 1
+                                       & is.na(away_goalie) == T)
+                                      |(event_type == 'GOAL'
+                                       & home_flag == 0
+                                       & is.na(home_goalie) == T),1,0))%>%
+  filter(empty_net_goal_flag != 1)
+
+```
+
+## Selecting the data to train the model on
+```{r}
+df.train<-df.pbp_18_19%>%
+  select(period_id,
+         event_index,
+         event_detail,
+         rebound_flag,
+         rush_flag,
+         coords_x,
+         coords_y,
+         shot_angle,
+         shot_distance,
+         goal_flag)%>%
+  mutate(event_detail = as.factor(gsub('-','_',event_detail)),
+         goal_flag=as.factor(goal_flag))
+
+df.train<-dummy_cols(df.train, select_columns = 'event_detail')
+
+df.train.id<-df.train%>%
+  select(period_id,
+         event_index)
+
+df.train<-df.train[,-c(1,2,3)]
+```
+
+
+# Building the model
+```{r}
+hyper_grid<-makeTuneControlGrid()
+kFold<-makeResampleDesc('RepCV', folds = 10, reps = 50)
+task.xG<-makeClassifTask(data = df.train, target = 'goal_flag', positive = '1')
+```
+
+## XGboost
+```{r}
+# listLearners()$class
+
+# getLearnerParamSet('classif.xgboost')
+# xg_boost.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0,upper=1),
+#                                    makeDiscreteParam('booster',values=c('gbtree','dart')),
+#                                    makeNumericParam('gamma',lower=0.1,upper=100),
+#                                    makeIntegerParam('max_depth',lower=2,upper=15))
+
+xg_boost.hyper_param<-makeParamSet(makeIntegerParam('max_depth',lower=15,upper=25))
+
+xg_boost.learner<-makeLearner('classif.xgboost')
+
+xg_boost.tune<-tuneParams('classif.xgboost', task = task.xG, resampling = kFold, par.set = xg_boost.hyper_param, control = hyper_grid, measures = list(tpr,f1))
+
+# listMeasures('classif', properties = 'classif')
+# xg_boost.CV<-resample(learner = xg_boost.learner, task = task.xG,resampling = kFold)
+
+```
+
+
+```{r}
+
+```
+
+
+
+

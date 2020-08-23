@@ -1,0 +1,54 @@
+---
+title: "NHL Scraper"
+output: html_document
+---
+# Set up
+## Packages
+```{r setup, include=FALSE}
+using<-function(...) {
+  libs<-unlist(list(...))
+  req<-unlist(lapply(libs,require,character.only=TRUE))
+  need<-libs[req==FALSE]
+  if(length(need)>0){ 
+    install.packages(need)
+    lapply(need,require,character.only=TRUE)
+  }
+}
+
+using('ggplot2','dplyr','rstudioapi','data.table','ggthemes','tidyr','lubridate','scales','grid','pracma','mlr','mclust','mlbench','kernlab','ranger','cmaes','e1071','devtools','readr','stringr','foreach','jsonlite','rvest','xml2','RCurl')
+
+if (Sys.getenv("JAVA_HOME")!="")
+  Sys.setenv(JAVA_HOME="")
+
+## Source scraper functions from GitHub
+devtools::source_url("https://raw.githubusercontent.com/evolvingwild/evolving-hockey/master/EH_scrape_functions.R")
+
+memory.limit(size=56000)
+
+options(digits=5)
+```
+
+## Directory
+```{r}
+current_path<-getActiveDocumentContext()$path
+setwd(dirname(current_path ))
+print(getwd())
+
+```
+
+# Data
+## Scrape data
+```{r}
+schedule20182019<-sc.scrape_schedule(start_date = as.Date('2018-10-03'), end_date = as.Date('2019-04-07'))
+schedule20192020<-sc.scrape_schedule(start_date = as.Date('2019-10-02'), end_date = as.Date('2019-03-13'))
+
+pbp_scrape_18_19<-sc.scrape_pbp(games = schedule20182019$game_id)
+pbp_scrape_19_20<-sc.scrape_pbp(games = schedule20192020$game_id)
+```
+
+## Save data to the /Data folder
+```{r}
+saveRDS(paste0(getwd(),'/Data/2018-2019_PbP_Data.rds',object = pbp_scrape_18_19))
+saveRDS(paste0(getwd(),'/Data/2019-2020_PbP_Data.rds',object = pbp_scrape_19_20))
+```
+
