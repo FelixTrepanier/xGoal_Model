@@ -1,5 +1,5 @@
 ---
-title: "xG Model v2"
+title: "xG Model"
 author: "FT"
 date: "15/08/2020"
 output: html_document
@@ -68,25 +68,27 @@ data.19_20<-readRDS(paste0(getwd(),'/Data/2019-2020_PbP_Data.rds'))
 df.pbp_18_19<-data.18_19$pbp_base
 df.pbp_19_20<-data.19_20$pbp_base
 
+df.pbp<-rbind(df.pbp_18_19,df.pbp_19_20)
 ```
+
 
 ## Data exploration
 ```{r}
-unique(df.pbp_18_19$event_type)
+unique(df.pbp$event_type)
 # Fenwick events are GOAL,MISS,SHOT
 
-unique(df.pbp_18_19$game_strength_state)
+unique(df.pbp$game_strength_state)
 # E means Extra, so Ev5 is 6v5, but can also be the start of the game before other team gets on ice
 
-unique(df.pbp_18_19$event_detail)
+unique(df.pbp$event_detail)
 # When its a fenwick event, this is where the shot type is recorded
 
 ```
 
-# Building the dataset
+# Building the training dataset
 ## Adding basic flags and diff time
 ```{r}
-df.pbp_18_19<-df.pbp_18_19%>%
+df.pbp<-df.pbp%>%
   filter(game_period<5)%>%
   mutate(goal_flag = ifelse(event_type == 'GOAL', 1, 0),
          home_flag = ifelse(event_team == home_team, 1, 0),
@@ -94,13 +96,13 @@ df.pbp_18_19<-df.pbp_18_19%>%
   group_by(period_id)%>%
   mutate(time_diff = game_seconds - lag(game_seconds))
 
-df.pbp_18_19$time_diff[is.na(df.pbp_18_19$time_diff)]<-0
+df.pbp$time_diff[is.na(df.pbp$time_diff)]<-0
 
 ```
 
 ## Adding rebound and rush flag
 ```{r}
-df.pbp_18_19<-df.pbp_18_19%>%
+df.pbp<-df.pbp%>%
   mutate(rebound_flag = ifelse(time_diff<3
                                & event_type %in% c('SHOT','GOAL','MISS')
                                & lag(event_type) %in% c('SHOT','GOAL','MISS')
@@ -110,14 +112,14 @@ df.pbp_18_19<-df.pbp_18_19%>%
                             & event_type %in% c('SHOT','GOAL','MISS'), 1, 0))%>%
   filter(event_type %in% c('SHOT','GOAL','MISS'))
 
-df.pbp_18_19$rebound_flag[is.na(df.pbp_18_19$rebound_flag)]<-0
-df.pbp_18_19$rush_flag[is.na(df.pbp_18_19$rush_flag)]<-0
+df.pbp$rebound_flag[is.na(df.pbp$rebound_flag)]<-0
+df.pbp$rush_flag[is.na(df.pbp$rush_flag)]<-0
 
 ```
 
 ## Adding shot location, angle, and distance
 ```{r}
-df.pbp_18_19<-df.pbp_18_19%>%
+df.pbp<-df.pbp%>%
   filter(coords_x != 'NA' & coords_y != 'NA')%>%
   mutate(coords_y = ifelse(coords_x < 0, -1*coords_y,coords_y),
          coords_x = abs(coords_x),
@@ -130,22 +132,22 @@ df.pbp_18_19<-df.pbp_18_19%>%
 ## Looking at shot types closely
 ### Dealing with NA
 ```{r}
-df.pbp_18_19%>%
+df.pbp%>%
   group_by(event_detail)%>%
   summarise(n())
 
-df.pbp_18_19%>%
+df.pbp%>%
   filter(is.na(event_detail)==T)
 
-# What are NA shot types? 7 goals out of 10 shots! Will be classified as "Other"
+# What are NA shot types? 14 goals out of 19 shots! Will be classified as "Other"
 
-df.pbp_18_19$event_detail[is.na(df.pbp_18_19$event_detail)]<-'Other'
+df.pbp$event_detail[is.na(df.pbp$event_detail)]<-'Other'
 ```
 
 ### Difference between Tip-In vs Deflected
 ```{r}
 # I am a bit worried tip-in might be a deflected shot that was a goal
-df.pbp_18_19%>%
+df.pbp%>%
   filter(event_detail %in% c('Tip-In','Deflected'))%>%
   group_by(event_detail)%>%
   summarize(goal_count = sum(goal_flag),
@@ -156,7 +158,7 @@ df.pbp_18_19%>%
 
 ## Removing empty net goals
 ```{r}
-df.pbp_18_19<-df.pbp_18_19%>%
+df.pbp<-df.pbp%>%
   mutate(empty_net_goal_flag = ifelse((event_type == 'GOAL'
                                        & home_flag == 1
                                        & is.na(away_goalie) == T)
@@ -167,7 +169,18 @@ df.pbp_18_19<-df.pbp_18_19%>%
 
 ```
 
-## Selecting the data to train the model on
+## Separating the two seasons
+```{r}
+df.pbp_18_19<-df.pbp%>%
+  filter(season == 20182019)
+
+df.pbp_19_20<-df.pbp%>%
+  filter(season == 20192020)
+
+rm(df.pbp)
+```
+
+## Training set
 ```{r}
 df.train<-df.pbp_18_19%>%
   select(period_id,
@@ -192,6 +205,32 @@ df.train.id<-df.train%>%
 df.train<-df.train[,-c(1,2,3)]
 ```
 
+## Test set
+```{r}
+df.test<-df.pbp_19_20%>%
+  select(period_id,
+         event_index,
+         event_detail,
+         rebound_flag,
+         rush_flag,
+         coords_x,
+         coords_y,
+         shot_angle,
+         shot_distance,
+         goal_flag)%>%
+  mutate(event_detail = as.factor(gsub('-','_',event_detail)),
+         goal_flag=as.factor(goal_flag))
+
+df.test<-dummy_cols(df.test, select_columns = 'event_detail')
+
+df.test.id<-df.test%>%
+  select(period_id,
+         event_index)
+
+df.test<-df.test[,-c(1,2,3)]
+
+```
+
 
 # Building the model
 ```{r}
@@ -210,7 +249,10 @@ task.xG<-makeClassifTask(data = df.train, target = 'goal_flag', positive = '1')
 #                                    makeNumericParam('gamma',lower=0.1,upper=100),
 #                                    makeIntegerParam('max_depth',lower=2,upper=15))
 
-xg_boost.hyper_param<-makeParamSet(makeIntegerParam('max_depth',lower=15,upper=25))
+xg_boost.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0.001,upper=0.03),
+                                   makeDiscreteParam('booster',values=c('gbtree')),
+                                   makeNumericParam('gamma',lower=0.1,upper=0.1),
+                                   makeIntegerParam('max_depth',lower=27,upper=27))
 
 xg_boost.learner<-makeLearner('classif.xgboost')
 
@@ -221,11 +263,39 @@ xg_boost.tune<-tuneParams('classif.xgboost', task = task.xG, resampling = kFold,
 
 ```
 
+## Confusion matrix
+```{r}
+xg_boost.temp<-resample(makeLearner('classif.xgboost',
+                                    par.vals = list('eta'=xg_boost.tune$x$eta,
+                                                    'booster'=xg_boost.tune$x$booster,
+                                                    'gamma'=xg_boost.tune$x$gamma ,
+                                                    'max_depth'=xg_boost.tune$x$max_depth)),
+                        task = task.xG,
+                        resampling = kFold)
 
+calculateConfusionMatrix(xg_boost.temp$pred)
+
+rm(xg_boost.temp)
+```
+
+# Looking at the model's results
+## Aggregating at the player/game level
 ```{r}
 
 ```
 
+## Aggregating at the player/season level
+```{r}
 
+```
 
+## Aggregating at the team/game level
+```{r}
+
+```
+
+## Aggregating at the team/season level
+```{r}
+
+```
 
