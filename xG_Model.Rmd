@@ -156,17 +156,42 @@ df.pbp%>%
 # No worries to have here. Maybe deflected is a pass that goes off a skate while tip in an intentionally deflected shot
 ```
 
-## Removing empty net goals
+## Removing empty net fenwick events
 ```{r}
 df.pbp<-df.pbp%>%
-  mutate(empty_net_goal_flag = ifelse((event_type == 'GOAL'
-                                       & home_flag == 1
+  mutate(empty_net_goal_flag = ifelse((home_flag == 1
                                        & is.na(away_goalie) == T)
-                                      |(event_type == 'GOAL'
-                                       & home_flag == 0
+                                      |(home_flag == 0
                                        & is.na(home_goalie) == T),1,0))%>%
   filter(empty_net_goal_flag != 1)
 
+```
+
+## Adding game strength
+```{r}
+df.pbp%>%
+  filter(game_strength_state %in% c('3v3','3v4','3v5','3vE',
+                                    '4v3','4v4','4v5','4vE',
+                                    '5v3','5v4','5v5','5vE',
+                                    'Ev3','Ev4','Ev5','EvE'))%>%
+  group_by(game_strength_state)%>%
+  summarise(n())
+
+df.pbp<-df.pbp%>%
+  filter(game_strength_state %in% c('3v3','3v4','3v5','3vE',
+                                    '4v3','4v4','4v5','4vE',
+                                    '5v3','5v4','5v5','5vE',
+                                    'Ev3','Ev4','Ev5','EvE'))%>%
+  mutate(even_strength_flag = ifelse(game_strength_state %in% c('5v5','4v4','3v3'),1,0),
+         empty_net_flag = ifelse((home_flag==1 & game_strength_state %in% c('Ev3','Ev4','Ev5'))
+                                 |(home_flag==0 & game_strength_state %in% c('3vE','4vE','5vE')),
+                                 1,0),
+         power_play_flag = ifelse((home_flag==1 & game_strength_state %in% c('5v3','5v4','4v3'))
+                                  |(home_flag==0 & game_strength_state %in% c('3v5','4v5','3v4')),
+                                  1,0),
+         short_handed_flag = ifelse((home_flag==1 & game_strength_state %in% c('3v5','4v5','3v4'))
+                                    |(home_flag==0 & game_strength_state %in% c('5v3','5v4','4v3')),
+                                    1,0))
 ```
 
 ## Separating the two seasons
@@ -192,6 +217,10 @@ df.train<-df.pbp_18_19%>%
          coords_y,
          shot_angle,
          shot_distance,
+         even_strength_flag,
+         empty_net_flag,
+         power_play_flag,
+         short_handed_flag,
          goal_flag)%>%
   mutate(event_detail = as.factor(gsub('-','_',event_detail)),
          goal_flag=as.factor(goal_flag))
@@ -217,6 +246,10 @@ df.test<-df.pbp_19_20%>%
          coords_y,
          shot_angle,
          shot_distance,
+         even_strength_flag,
+         empty_net_flag,
+         power_play_flag,
+         short_handed_flag,
          goal_flag)%>%
   mutate(event_detail = as.factor(gsub('-','_',event_detail)),
          goal_flag=as.factor(goal_flag))
@@ -235,7 +268,7 @@ df.test<-df.test[,-c(1,2,3)]
 ## Model training parameters
 ```{r}
 # hyper_grid<-makeTuneControlGrid()
-hyper_grid<-makeTuneControlRandom(maxit = 100L)
+hyper_grid<-makeTuneControlRandom(maxit = 500L)
 
 # rdesc<-makeResampleDesc('RepCV', folds = 5, reps = 20)
 rdesc<-makeResampleDesc('CV', iters = 5)
@@ -243,11 +276,11 @@ task.xG<-makeClassifTask(data = df.train, target = 'goal_flag', positive = '1')
 ```
 
 ## XGboost
-### XGboost definition
+### XGboost learner tuning
 ```{r}
 # listLearners()$class
 
-getLearnerParamSet('classif.xgboost')
+# getLearnerParamSet('classif.xgboost')
 
 xg_boost.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0.01,upper=0.2),
                                    makeNumericParam('lambda',lower=0,upper=2),
@@ -261,10 +294,28 @@ xg_boost.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0.01,upper=0.2),
                                    makeIntegerParam('nrounds',lower=50,upper=1000),
                                    makeIntegerParam('early_stopping_rounds',lower=25,upper=25))
 
+# xg_boost.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0.01,upper=0.15),
+#                                    makeNumericParam('lambda',lower=0,upper=2),
+#                                    makeNumericParam('alpha',lower=0,upper=1),
+#                                    makeNumericParam('max_delta_step',lower=2,upper=9),
+#                                    makeNumericParam('gamma',lower=0.05,upper=0.4),
+#                                    makeNumericParam('subsample',lower=0.6,upper=0.95),
+#                                    makeNumericParam('colsample_bytree',lower=0.6,upper=0.9),
+#                                    makeIntegerParam('min_child_weight',lower=1,upper=30),
+#                                    makeIntegerParam('max_depth',lower=3,upper=15),
+#                                    makeIntegerParam('nrounds',lower=50,upper=600),
+#                                    makeIntegerParam('early_stopping_rounds',lower=25,upper=25))
+
 xg_boost.learner<-makeLearner('classif.xgboost',predict.type='prob')
 
 xg_boost.tune<-tuneParams(xg_boost.learner, task = task.xG, resampling = rdesc, par.set = xg_boost.hyper_param, control = hyper_grid, measures = list(auc))
 
+df.xg_boost.tune<-as.data.frame(xg_boost.tune$opt.path)
+
+```
+
+## XGboost learner final tune
+```{r}
 xg_boost.learner<-makeLearner('classif.xgboost',
                               par.vals = list('eta'=xg_boost.tune$x$eta,
                                               'lambda'=xg_boost.tune$x$lambda,
@@ -297,7 +348,10 @@ calculateConfusionMatrix(predict(xg_boost.model, task = task.xG))
 
 ggplot()+
   geom_histogram(aes(x=xg_boost.pred))
-  
+
+save.image(paste0(dirname(getwd()),'/xG.RData'))
+
+
 ```
 
 # Looking at the model's results
