@@ -26,7 +26,7 @@ using<-function(...) {
   }
 }
 
-using('ggplot2','dplyr','rstudioapi','data.table','ggthemes','tidyr','lubridate','scales','grid','pracma','mlr','mclust','mlbench','kernlab','ranger','cmaes','e1071','devtools','readr','stringr','foreach','jsonlite','rvest','xml2','RCurl','xgboost','fastDummies')
+using('ggplot2','dplyr','rstudioapi','data.table','ggthemes','tidyr','lubridate','scales','grid','pracma','mlr','mclust','mlbench','kernlab','ranger','cmaes','e1071','devtools','readr','stringr','foreach','jsonlite','rvest','xml2','RCurl','xgboost','fastDummies','neuralnet')
 
 if (Sys.getenv("JAVA_HOME")!="")
   Sys.setenv(JAVA_HOME="")
@@ -272,7 +272,9 @@ hyper_grid<-makeTuneControlRandom(maxit = 500L)
 
 # rdesc<-makeResampleDesc('RepCV', folds = 5, reps = 20)
 rdesc<-makeResampleDesc('CV', iters = 5)
-task.xG<-makeClassifTask(data = df.train, target = 'goal_flag', positive = '1')
+task.train_xG<-makeClassifTask(data = df.train, target = 'goal_flag', positive = '1')
+task.test_xG<-makeClassifTask(data = df.test, target = 'goal_flag', positive = '1')
+
 ```
 
 ## XGboost
@@ -314,7 +316,7 @@ df.xg_boost.tune<-as.data.frame(xg_boost.tune$opt.path)
 
 ```
 
-## XGboost learner final tune
+### XGboost learner final tune
 ```{r}
 xg_boost.learner<-makeLearner('classif.xgboost',
                               par.vals = list('eta'=xg_boost.tune$x$eta,
@@ -335,24 +337,123 @@ xg_boost.learner<-makeLearner('classif.xgboost',
 
 ```
 
-### First look at the results from XGboost
+### First look at the results on the train set from XGboost
 ```{r}
-xg_boost.model<-train(xg_boost.learner,task.xG)
+xg_boost.train_model<-train(xg_boost.learner,task.train_xG)
 
-xg_boost.pred = getPredictionProbabilities(predict(xg_boost.model, task = task.xG))
+xg_boost.train_pred = getPredictionProbabilities(predict(xg_boost.train_model, task = task.train_xG))
 
-head(xg_boost.pred)
-mean(xg_boost.pred)
+head(xg_boost.train_pred)
+mean(xg_boost.train_pred)
 
-calculateConfusionMatrix(predict(xg_boost.model, task = task.xG))
+calculateConfusionMatrix(predict(xg_boost.train_model, task = task.train_xG))
 
 ggplot()+
-  geom_histogram(aes(x=xg_boost.pred))
-
-save.image(paste0(dirname(getwd()),'/xG.RData'))
-
+  geom_histogram(aes(x=xg_boost.train_pred))
 
 ```
+
+### First look at the results on the test set from XGboost
+```{r}
+xg_boost.test_model<-train(xg_boost.learner,task.test_xG)
+
+xg_boost.test_pred = getPredictionProbabilities(predict(xg_boost.test_model, task = task.test_xG))
+
+head(xg_boost.test_pred)
+mean(xg_boost.test_pred)
+
+calculateConfusionMatrix(predict(xg_boost.test_model, task = task.test_xG))
+
+ggplot()+
+  geom_histogram(aes(x=xg_boost.test_pred))
+
+df.pbp_19_20$xG_xgboost<-xg_boost.test_pred
+# save.image(paste0(dirname(getwd()),'/xG.RData'))
+# load(paste0(dirname(getwd()),'/xG.RData'))
+
+```
+
+## Neural networks
+### Neural networks learner tuning
+```{r}
+# listLearners()$class
+
+getLearnerParamSet('classif.neuralnet')
+
+neural_net.hyper_param<-makeParamSet(makeNumericParam('eta',lower=0.01,upper=0.2),
+                                   makeNumericParam('lambda',lower=0,upper=2),
+                                   makeNumericParam('alpha',lower=0,upper=2),
+                                   makeNumericParam('max_delta_step',lower=1,upper=10),
+                                   makeNumericParam('gamma',lower=0.01,upper=0.2),
+                                   makeNumericParam('subsample',lower=0.5,upper=0.95),
+                                   makeNumericParam('colsample_bytree',lower=0.5,upper=0.9),
+                                   makeIntegerParam('min_child_weight',lower=1,upper=40),
+                                   makeIntegerParam('max_depth',lower=3,upper=27),
+                                   makeIntegerParam('nrounds',lower=50,upper=1000),
+                                   makeIntegerParam('early_stopping_rounds',lower=25,upper=25))
+
+neural_net.learner<-makeLearner('classif.neuralnet',predict.type='prob')
+
+neural_net.tune<-tuneParams(neural_net.learner, task = task.xG, resampling = rdesc, par.set = neural_net.hyper_param, control = hyper_grid, measures = list(auc))
+
+df.neural_net.tune<-as.data.frame(neural_net.tune$opt.path)
+
+```
+
+### Neural networks learner final tune
+```{r}
+neural_net.learner<-makeLearner('classif.neuralnet',
+                              par.vals = list('eta'=xg_boost.tune$x$eta,
+                                              'lambda'=xg_boost.tune$x$lambda,
+                                              'alpha'=xg_boost.tune$x$alpha,
+                                              'max_delta_step'=xg_boost.tune$x$max_delta_step,
+                                              'gamma'=xg_boost.tune$x$gamma ,
+                                              'subsample'=xg_boost.tune$x$subsample,
+                                              'colsample_bytree'=xg_boost.tune$x$colsample_bytree,
+                                              'min_child_weight'=xg_boost.tune$x$min_child_weight,
+                                              'max_depth'=xg_boost.tune$x$max_depth,
+                                              'nrounds'=xg_boost.tune$x$nrounds,
+                                              'early_stopping_rounds'=xg_boost.tune$x$early_stopping_rounds),
+                              predict.type='prob')
+
+```
+
+### First look at the results on the train set from neural networks
+```{r}
+neural_net.train_model<-train(neural_net.learner,task.train_xG)
+
+neural_net.train_pred = getPredictionProbabilities(predict(neural_net.train_model, task = task.train_xG))
+
+head(neural_net.train_pred)
+mean(neural_net.train_pred)
+
+calculateConfusionMatrix(predict(neural_net.train_model, task = task.train_xG))
+
+ggplot()+
+  geom_histogram(aes(x=neural_net.train_pred))
+
+```
+
+### First look at the results on the test set from neural networks
+```{r}
+neural_net.test_model<-train(neural_net.learner,task.test_xG)
+
+neural_net.test_pred = getPredictionProbabilities(predict(neural_net.test_model, task = task.test_xG))
+
+head(neural_net.test_pred)
+mean(neural_net.test_pred)
+
+calculateConfusionMatrix(predict(neural_net.test_model, task = task.test_xG))
+
+ggplot()+
+  geom_histogram(aes(x=neural_net.test_pred))
+
+df.pbp_19_20$xneural_net<-neural_net.test_pred
+# save.image(paste0(dirname(getwd()),'/xG.RData'))
+# load(paste0(dirname(getwd()),'/xG.RData'))
+
+```
+
 
 # Looking at the model's results
 ## Aggregating at the player/game level
