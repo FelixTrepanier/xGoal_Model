@@ -85,7 +85,7 @@ unique(df.pbp$event_detail)
 
 ```
 
-# Building the training dataset
+# Building the dataset
 ## Adding basic flags and diff time
 ```{r}
 df.pbp<-df.pbp%>%
